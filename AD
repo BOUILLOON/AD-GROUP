@@ -1,0 +1,224 @@
+Inventaire des droits et groupes
+```Powershell
+param (
+    [string]$OUPath = "OU=Groupes,DC=example,DC=com",
+    [string]$OutputPath = "C:\Rapports\GroupsInOU.csv"
+)
+
+function Get-GroupMembers {
+    param ([string]$GroupName)
+    try {
+        Get-ADGroupMember -Identity $GroupName -ErrorAction Stop | ForEach-Object {
+            if ($_.ObjectClass -eq "user") {
+                [PSCustomObject]@{
+                    MemberType = "User"
+                    Name = $_.Name
+                    SamAccountName = $_.SamAccountName
+                }
+            } elseif ($_.ObjectClass -eq "group") {
+                [PSCustomObject]@{
+                    MemberType = "Group"
+                    Name = $_.Name
+                    SamAccountName = $_.SamAccountName
+                }
+            }
+        }
+    } catch {
+        Write-Warning "Impossible d'obtenir les membres pour le groupe $GroupName : $_"
+        @()
+    }
+}
+
+$groups = Get-ADGroup -SearchBase $OUPath -Filter * -Properties MemberOf, Description, ManagedBy, WhenCreated, WhenChanged
+
+$groupData = foreach ($group in $groups) {
+    $groupMembers = Get-GroupMembers -GroupName $group.Name
+    [PSCustomObject]@{
+        GroupName        = $group.Name
+        Description      = $group.Description
+        GroupScope       = $group.GroupScope
+        GroupCategory    = $group.GroupCategory
+        ManagedBy        = $group.ManagedBy
+        WhenCreated      = $group.WhenCreated
+        WhenChanged      = $group.WhenChanged
+        MemberOf         = ($group.MemberOf -join ";")
+        Members          = ($groupMembers | ForEach-Object { $_.SamAccountName }) -join ";"
+        MemberDetails    = ($groupMembers | ForEach-Object { "$($_.MemberType):$($_.Name)" }) -join ";"
+    }
+}
+
+$groupData | Export-Csv -Path $OutputPath -NoTypeInformation -Force
+Write-Output "Export des groupes terminé. Rapport disponible : $OutputPath"
+
+```
+
+
+analyse : 
+```powershell 
+function AnalyzeGroup {
+    param ([string]$RootGroup, [string]$ReportPath)
+
+    $visitedGroups = @{}
+    $disabledUsers = @()
+    $unusedGroups = @()
+
+    function TraverseGroup {
+        param ([string]$currentGroup)
+        if ($visitedGroups[$currentGroup]) {
+            Write-Output "Cycle détecté : $currentGroup"
+            return
+        }
+        $visitedGroups[$currentGroup] = $true
+
+        $members = Get-ADGroupMember -Identity $currentGroup -ErrorAction SilentlyContinue
+        foreach ($member in $members) {
+            if ($member.ObjectClass -eq "user") {
+                $user = Get-ADUser -Identity $member.SamAccountName -Properties Enabled
+                if (-not $user.Enabled) {
+                    $disabledUsers += $user.SamAccountName
+                }
+            } elseif ($member.ObjectClass -eq "group") {
+                TraverseGroup $member.Name
+            }
+        }
+
+        $group = Get-ADGroup -Identity $currentGroup
+        if (-not (Get-ADGroupMember -Identity $currentGroup)) {
+            $unusedGroups += $currentGroup
+        }
+    }
+
+    TraverseGroup $RootGroup
+
+    $results = @(
+        @{ Property = "DisabledUsers"; Value = $disabledUsers -join ";" },
+        @{ Property = "UnusedGroups"; Value = $unusedGroups -join ";" }
+    )
+    $results | Export-Csv -Path $ReportPath -NoTypeInformation -Force
+    Write-Output "Analyse des groupes terminée. Rapport : $ReportPath"
+}
+```
+
+intégrité des données : 
+```powershell 
+Get-FileHash -Path "C:\Path\To\File" -Algorithm SHA256
+```
+
+#### **Description des étapes automatisées :**
+
+1. **Itération sur tous les groupes de l’OU.**
+2. **Création automatique des GDL pour chaque GG trouvé.**
+3. **Liaison des GDL aux GG correspondants.**
+4. **Application des permissions NTFS à partir d’une configuration prédéfinie.**
+
+```powershell 
+param (
+    [string]$OUPath = "OU=Groupes,DC=example,DC=com", # Chemin LDAP de l'OU contenant les groupes
+    [hashtable]$FolderPermissions = @{ # Mapping entre les noms des groupes et les dossiers à sécuriser
+        "GG_FILE_vert" = "C:\Partage\vert"
+        "GG_FILE_bleu" = "C:\Partage\bleu"
+    }
+)
+
+# Fonction : Créer un groupe si non existant
+function Ensure-GroupExists {
+    param (
+        [string]$GroupName,
+        [string]$GroupScope,
+        [string]$Description
+    )
+    if (-not (Get-ADGroup -Filter { Name -eq $GroupName })) {
+        New-ADGroup -Name $GroupName -GroupScope $GroupScope -Description $Description
+        Write-Output "Groupe $GroupName créé avec succès."
+    } else {
+        Write-Output "Groupe $GroupName déjà existant."
+    }
+}
+
+# 1. Itération sur tous les groupes de l’OU
+$groups = Get-ADGroup -SearchBase $OUPath -Filter * -Properties Description
+foreach ($group in $groups) {
+    $GGName = "GG_$($group.Name)"  # Nom du groupe global
+    $GDLName = "GDL_$($group.Name)" # Nom du groupe local de domaine
+    $Description = $group.Description
+
+    # 2. Création du groupe global (GG)
+    Ensure-GroupExists -GroupName $GGName -GroupScope "Global" -Description "Groupe global pour $group.Name"
+
+    # 3. Création du groupe local de domaine (GDL)
+    Ensure-GroupExists -GroupName $GDLName -GroupScope "DomainLocal" -Description "Groupe local de domaine pour $group.Name"
+
+    # 4. Liaison des GG aux GDL correspondants
+    Add-ADGroupMember -Identity $GDLName -Members $GGName -ErrorAction SilentlyContinue
+    Write-Output "GG $GGName ajouté à GDL $GDLName."
+
+    # 5. Application des permissions NTFS (si dossier configuré pour ce groupe)
+    if ($FolderPermissions.ContainsKey($GGName)) {
+        $folderPath = $FolderPermissions[$GGName]
+        $acl = Get-Acl $folderPath
+        $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $GDLName, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow"
+        )
+        $acl.AddAccessRule($accessRule)
+        Set-Acl -Path $folderPath -AclObject $acl
+        Write-Output "Permissions NTFS appliquées pour $GDLName sur $folderPath."
+    } else {
+        Write-Warning "Aucun dossier configuré pour le groupe $GGName."
+    }
+}
+
+Write-Output "Réorganisation des droits terminée."
+
+```
+juste vert 
+```Powershell
+param (
+    [string]$OUPath = "OU=Groupes_vert,DC=example,DC=com", # OU spécifique au serveur vert
+    [string]$FolderPath = "C:\Partage\vert" # Chemin du dossier à sécuriser
+)
+
+# Fonction : Créer un groupe si non existant
+function Ensure-GroupExists {
+    param (
+        [string]$GroupName,
+        [string]$GroupScope,
+        [string]$Description
+    )
+    if (-not (Get-ADGroup -Filter { Name -eq $GroupName })) {
+        New-ADGroup -Name $GroupName -GroupScope $GroupScope -Description $Description
+        Write-Output "Groupe $GroupName créé avec succès."
+    } else {
+        Write-Output "Groupe $GroupName déjà existant."
+    }
+}
+
+# Itération sur tous les groupes de l’OU
+$groups = Get-ADGroup -SearchBase $OUPath -Filter * -Properties Description
+foreach ($group in $groups) {
+    $GGName = "GG_$($group.Name)"  # Nom du groupe global
+    $GDLName = "GDL_$($group.Name)" # Nom du groupe local de domaine
+    $Description = $group.Description
+
+    # 1. Création du groupe global (GG)
+    Ensure-GroupExists -GroupName $GGName -GroupScope "Global" -Description "Groupe global pour $group.Name"
+
+    # 2. Création du groupe local de domaine (GDL)
+    Ensure-GroupExists -GroupName $GDLName -GroupScope "DomainLocal" -Description "Groupe local de domaine pour $group.Name"
+
+    # 3. Liaison des GG aux GDL correspondants
+    Add-ADGroupMember -Identity $GDLName -Members $GGName -ErrorAction SilentlyContinue
+    Write-Output "GG $GGName ajouté à GDL $GDLName."
+
+    # 4. Application des permissions NTFS
+    $acl = Get-Acl $FolderPath
+    $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $GDLName, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow"
+    )
+    $acl.AddAccessRule($accessRule)
+    Set-Acl -Path $FolderPath -AclObject $acl
+    Write-Output "Permissions NTFS appliquées pour $GDLName sur $FolderPath."
+}
+
+Write-Output "Réorganisation des droits pour vert terminée."
+
+```
