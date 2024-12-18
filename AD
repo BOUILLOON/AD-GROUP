@@ -1,183 +1,277 @@
- ```Powershell
-$GroupeList = Get-ADGroup -SearchBase 'OU=Groupes de sécurité,OU=FAEC,OU=SITES,DC=faec,DC=loc' -Filter *
+# Script 1: Exportation d'une OU Active Directory
+# Ce script exporte une OU et toute sa hiérarchie, ses objets et les appartenances aux groupes dans un fichier JSON.
 
-foreach ($Groupe in $GroupeList) {
-    Get-ADGroupMember -Identity $Groupe.DistinguishedName | Where-Object { $_.ObjectClass -eq "group" }
-}
-```
+# Configuration initiale
+param (
+    [string]$OU, # Chemin LDAP de l'OU 
+    [string]$OutputFile # Fichier JSON pour stocker les données exportées
+)
 
-```Powershell
-$SousGroupes = @()
-
-$GroupeList = Get-ADGroup -SearchBase 'OU=Groupes de sécurité,OU=FAEC,OU=SITES,DC=faec,DC=loc' -Filter *
-
-foreach ($Groupe in $GroupeList) {
-    $Membres = Get-ADGroupMember -Identity $Groupe.DistinguishedName | Where-Object { $_.ObjectClass -eq "group" }
-    foreach ($Membre in $Membres) {
-        $SousGroupes += [PSCustomObject]@{
-            ParentGroup = $Groupe.Name
-            SubGroup    = $Membre.Name
-            SubGroupDN  = $Membre.DistinguishedName
-        }
-    }
+# Vérifier que le module Active Directory est chargé
+if (-not (Get-Module -Name ActiveDirectory)) {
+    Import-Module ActiveDirectory -ErrorAction Stop
 }
 
-# Export en CSV si nécessaire
-$SousGroupes | Export-Csv -Path "C:\Rapports\SousGroupes.csv" -NoTypeInformation -Force
-Write-Output "Liste des sous-groupes exportée avec succès."
-```
-```Powershell
-# Liste des groupes inutilisés (sans membres) dans une OU spécifique
-Get-ADGroup -SearchBase "OU=Groupes de sécurité,OU=FAEC,OU=SITES,DC=faec,DC=loc" -Filter * |
-Where-Object { (Get-ADGroupMember -Identity $_.SamAccountName -ErrorAction SilentlyContinue).Count -eq 0 } |
-Select-Object Name
-```
-```Powershell
-# Définir l'OU source et le chemin d'export
-$OULocation = "OU=Groupes de sécurité,OU=FAEC,OU=SITES,DC=faec,DC=loc"
-$ExportPath = "C:\Rapports\Export_OU_Full.csv"
-
-# Récupération de tous les groupes de l'OU spécifiée
-$GroupeList = Get-ADGroup -SearchBase $OULocation -Filter *
-
-# Tableaux pour stocker les données exportées
-$ExportData = @()
-
-# Parcourir chaque groupe et récupérer ses informations
-foreach ($Groupe in $GroupeList) {
-    # Récupérer les membres qui sont des sous-groupes
-    $SousGroupes = Get-ADGroupMember -Identity $Groupe.DistinguishedName | Where-Object { $_.ObjectClass -eq "group" }
-
-    # Récupérer les groupes auxquels ce groupe appartient (MemberOf)
-    $GroupesParents = Get-ADGroup -Identity $Groupe.DistinguishedName -Properties MemberOf | Select-Object -ExpandProperty MemberOf
-
-    # Ajouter chaque relation de sous-groupe
-    foreach ($SousGroupe in $SousGroupes) {
-        $ExportData += [PSCustomObject]@{
-            Group          = $Groupe.Name
-            Member         = $SousGroupe.Name
-            MemberDN       = $SousGroupe.DistinguishedName
-            Relation       = "Member"
-        }
-    }
-
-    # Ajouter chaque relation de groupe parent
-    foreach ($Parent in $GroupesParents) {
-        $ExportData += [PSCustomObject]@{
-            Group          = $Groupe.Name
-            Member         = $null
-            MemberDN       = $Parent
-            Relation       = "MemberOf"
-        }
-    }
-
-    # Ajouter les propriétés principales du groupe lui-même
-    $ExportData += [PSCustomObject]@{
-        Group          = $Groupe.Name
-        Member         = "N/A"
-        MemberDN       = $Groupe.DistinguishedName
-        Relation       = "Group Properties"
-    }
+# Vérifier que l'OU existe
+if (-not (Get-ADOrganizationalUnit -Filter { DistinguishedName -eq $OU } -ErrorAction SilentlyContinue)) {
+    Write-Error "L'OU $OU n'existe pas."
+    exit
 }
 
-# Exporter les données consolidées dans un fichier CSV
-$ExportData | Export-Csv -Path $ExportPath -NoTypeInformation -Force
-Write-Output "Export complet de l'OU '$OULocation' terminé avec succès. Fichier : $ExportPath"
-```
-
-```Powershell
-# Définir l'OU cible pour l'importation
-$TargetOU = "OU=Groupes de sécurité,OU=NouvelleFAEC,OU=SITES,DC=faec,DC=loc"
-$ImportPath = "C:\Rapports\Export_OU_Full.csv"
-
-# Charger les données depuis le fichier CSV
-$ImportData = Import-Csv -Path $ImportPath
-
-# Créer les groupes dans la nouvelle OU
-$GroupList = $ImportData | Where-Object { $_.Relation -eq "Group Properties" }
-
-foreach ($Group in $GroupList) {
-    New-ADGroup -Name $Group.Group -SamAccountName $Group.Group -GroupCategory Security -GroupScope Global -Path $TargetOU
-}
-
-# Associer les membres et les relations
-foreach ($Entry in $ImportData) {
-    if ($Entry.Relation -eq "Member") {
-        # Ajouter des sous-groupes
-        Add-ADGroupMember -Identity $Entry.Group -Members $Entry.MemberDN
-    } elseif ($Entry.Relation -eq "MemberOf") {
-        # Ajouter des relations parent
-        Add-ADGroupMember -Identity $Entry.MemberDN -Members $Entry.Group
-    }
-}
-
-Write-Output "Import complet dans l'OU '$TargetOU' terminé avec succès."
-```
-
-```Powershell
-# Fonction pour afficher les groupes AD et leurs membres en arborescence
-function Show-ADGroupTreeView {
+# Fonction pour exporter les OUs et leur hiérarchie
+function Export-OUs {
     param (
-        [Parameter(Mandatory = $true)]
-        [string]$SearchBase,  # Base de recherche dans l'OU
-        [int]$Indent = 0,     # Gestion de l'indentation
-        [hashtable]$VisitedGroups = @{}  # Garde la trace des groupes visités
+        [string]$OU
     )
 
-    # Récupérer les groupes dans l'OU
-    $Groups = Get-ADGroup -SearchBase $SearchBase -Filter *
+    $ouList = @()
 
-    foreach ($Group in $Groups) {
-        $prefix = " " * $Indent + "|__"
+    $currentOU = Get-ADOrganizationalUnit -Filter { DistinguishedName -eq $OU } -Properties *
+    $ouList += [PSCustomObject]@{
+        Name         = $currentOU.Name
+        DistinguishedName = $currentOU.DistinguishedName
+        Properties   = $currentOU | Select-Object -ExcludeProperty DistinguishedName
+    }
 
-        # Vérifier si le groupe a déjà été visité
-        if ($VisitedGroups.ContainsKey($Group.Name)) {
-            Write-Host "$prefix Loop found on $($Group.Name), Skipping..." -ForegroundColor Red
+    $childOUs = Get-ADOrganizationalUnit -Filter { ParentContainer -eq $OU }
+    foreach ($child in $childOUs) {
+        $ouList += Export-OUs -OU $child.DistinguishedName
+    }
+
+    return $ouList
+}
+
+# Fonction pour exporter les objets dans une OU
+function Export-Objects {
+    param (
+        [string]$OU
+    )
+
+    $objects = @()
+
+    $entries = Get-ADObject -Filter { ObjectClass -in ('user', 'group', 'computer') -and DistinguishedName -like "*$OU" } -Properties *
+    foreach ($entry in $entries) {
+        $objects += [PSCustomObject]@{
+            Name             = $entry.Name
+            DistinguishedName = $entry.DistinguishedName
+            ObjectClass      = $entry.ObjectClass
+            Properties       = $entry | Select-Object -ExcludeProperty DistinguishedName, ObjectClass
+        }
+    }
+
+    return $objects
+}
+
+# Fonction pour exporter les appartenances aux groupes
+function Export-GroupMemberships {
+    param (
+        [array]$Groups
+    )
+
+    $memberships = @()
+
+    foreach ($group in $Groups) {
+        $groupMembers = Get-ADGroupMember -Identity $group.DistinguishedName -ErrorAction SilentlyContinue
+        if ($groupMembers) {
+            $memberships += [PSCustomObject]@{
+                Group   = $group.DistinguishedName
+                Members = $groupMembers.DistinguishedName
+            }
+        }
+    }
+
+    return $memberships
+}
+
+Write-Host "Exportation de l'OU $OU en cours..." -ForegroundColor Green
+
+try {
+    # Exporter les OUs
+    $exportedOUs = Export-OUs -OU $OU
+
+    # Exporter les objets
+    $exportedObjects = Export-Objects -OU $OU
+
+    # Exporter les appartenances aux groupes
+    $exportedGroups = $exportedObjects | Where-Object { $_.ObjectClass -eq 'group' }
+    $groupMemberships = Export-GroupMemberships -Groups $exportedGroups
+
+    # Compilation des données exportées
+    $exportData = [PSCustomObject]@{
+        OUs             = $exportedOUs
+        Objects         = $exportedObjects
+        GroupMemberships = $groupMemberships
+    }
+
+    # Sauvegarde des données dans le fichier JSON
+    $exportData | ConvertTo-Json -Depth 10 | Set-Content -Path $OutputFile -Encoding UTF8
+
+    Write-Host "Exportation terminée. Données sauvegardées dans $OutputFile" -ForegroundColor Green
+} catch {
+    Write-Error "Erreur lors de l'exportation : $_"
+}
+    
+
+
+
+###########################################################################################
+
+
+
+# Script 2: Importation d'une OU Active Directory
+# Ce script recrée une OU exportée avec sa hiérarchie et ses objets dans un nouvel environnement Active Directory.
+
+# Configuration initiale
+param (
+    [string]$InputFile, # Fichier JSON contenant les données exportées
+    [string]$TargetOU, # Chemin LDAP de l'OU cible où les données seront importées
+    [switch]$DryRun # Si activé, ne crée pas d'objets mais simule les actions
+)
+
+# Vérifier que le module Active Directory est chargé
+if (-not (Get-Module -Name ActiveDirectory)) {
+    Import-Module ActiveDirectory -ErrorAction Stop
+}
+
+# Charger les données exportées
+if (-not (Test-Path $InputFile)) {
+    Write-Error "Le fichier $InputFile n'existe pas."
+    exit
+}
+
+$data = Get-Content -Path $InputFile | ConvertFrom-Json
+
+# Détection automatique du domaine et du contrôleur de domaine
+$DomainContext = Get-ADDomain -ErrorAction Stop
+$DefaultNC = (Get-ADRootDSE).defaultNamingContext
+
+# Validation ou création de l'OU cible
+function Ensure-TargetOU {
+    param (
+        [string]$TargetOU
+    )
+
+    if (-not (Get-ADOrganizationalUnit -Filter { DistinguishedName -eq $TargetOU } -ErrorAction SilentlyContinue)) {
+        if (-not $DryRun) {
+            try {
+                $ouParts = $TargetOU -split ","
+                $currentPath = ""
+                foreach ($part in $ouParts) {
+                    $currentPath = if ($currentPath -eq "") { $part } else { "$part,$currentPath" }
+                    if (-not (Get-ADOrganizationalUnit -Filter { DistinguishedName -eq $currentPath } -ErrorAction SilentlyContinue)) {
+                        New-ADOrganizationalUnit -Name ($currentPath -replace "OU=", "") -Path ($currentPath -replace "OU=.*?,") -ErrorAction Stop
+                        Write-Host "OU créée : $currentPath" -ForegroundColor Green
+                    }
+                }
+            } catch {
+                Write-Error "Impossible de créer l'OU cible : $TargetOU ($_)."
+            }
+        } else {
+            Write-Host "[Simulation] Vérification ou création de l'OU cible : $TargetOU"
+        }
+    } else {
+        Write-Host "OU cible existante : $TargetOU" -ForegroundColor Green
+    }
+}
+
+# Fonction pour recréer les OUs
+function Import-OUs {
+    param (
+        [array]$OUs, 
+        [string]$TargetOU
+    )
+
+    foreach ($ou in $OUs) {
+        $newOU = "OU=$($ou.Name),$TargetOU"
+        if (-not $DryRun) {
+            try {
+                New-ADOrganizationalUnit -Name $ou.Name -Path $TargetOU -ErrorAction Stop
+                Write-Host "OU créée : $newOU" -ForegroundColor Green
+            } catch {
+                Write-Warning "Impossible de créer l'OU : $newOU ($_)."
+            }
+        } else {
+            Write-Host "[Simulation] OU à créer : $newOU"
+        }
+    }
+}
+
+# Fonction pour recréer les objets (utilisateurs, groupes, ordinateurs)
+function Import-Objects {
+    param (
+        [array]$Objects
+    )
+
+    foreach ($obj in $Objects) {
+        if ($DryRun) {
+            Write-Host "[Simulation] Création de l'objet : $($obj.DistinguishedName)"
             continue
         }
 
-        # Marquer le groupe comme visité
-        $VisitedGroups[$Group.Name] = $true
+        try {
+            switch ($obj.ObjectClass) {
+                "user" {
+                    New-ADUser -Name $obj.Name -Path $TargetOU -OtherAttributes $obj.Properties -ErrorAction Stop
+                    Write-Host "Utilisateur créé : $($obj.DistinguishedName)" -ForegroundColor Green
+                }
+                "group" {
+                    # Créer uniquement les groupes dans cette passe
+                    New-ADGroup -Name $obj.Name -GroupScope Global -Path $TargetOU -ErrorAction Stop
+                    Write-Host "Groupe créé : $($obj.DistinguishedName)" -ForegroundColor Green
+                }
+                "computer" {
+                    New-ADComputer -Name $obj.Name -Path $TargetOU -ErrorAction Stop
+                    Write-Host "Ordinateur créé : $($obj.DistinguishedName)" -ForegroundColor Green
+                }
+                default {
+                    Write-Warning "Type d'objet non pris en charge : $($obj.ObjectClass)"
+                }
+            }
+        } catch {
+            Write-Warning "Erreur lors de la création de l'objet : $($obj.DistinguishedName) ($_)."
+        }
+    }
+}
 
-        # Afficher le groupe actuel
-        Write-Host "$prefix $($Group.Name)" -ForegroundColor Cyan
+# Fonction pour restaurer les appartenances aux groupes (deuxième passe)
+function Import-GroupMemberships {
+    param (
+        [array]$GroupMemberships
+    )
 
-        # Récupérer les membres du groupe
-        $Members = Get-ADGroupMember -Identity $Group.SamAccountName -ErrorAction SilentlyContinue
+    foreach ($membership in $GroupMemberships) {
+        if ($DryRun) {
+            Write-Host "[Simulation] Ajout des membres au groupe : $($membership.Group)"
+            continue
+        }
 
-        foreach ($Member in $Members) {
-            if ($Member.ObjectClass -eq "group") {
-                # Appel récursif pour les groupes imbriqués
-                Show-ADGroupTreeView -SearchBase "CN=$($Member.SamAccountName),CN=Users,DC=domain,DC=com" -Indent ($Indent + 4) -VisitedGroups $VisitedGroups
-            } else {
-                # Afficher les membres non-groupes
-                Write-Host (" " * ($Indent + 4) + "|__" + $Member.Name) -ForegroundColor White
+        foreach ($member in $membership.Members) {
+            try {
+                Add-ADGroupMember -Identity $membership.Group -Members $member -ErrorAction Stop
+                Write-Host "Membre ajouté : $member au groupe $($membership.Group)" -ForegroundColor Green
+            } catch {
+                Write-Warning "Erreur lors de l'ajout du membre $member au groupe $($membership.Group) ($_)."
             }
         }
     }
 }
 
-# Exemple d'utilisation : Base de recherche dans l'OU cible
-Show-ADGroupTreeView -SearchBase "OU=Groupes de sécurité,OU=FAEC,OU=SITES,DC=faec,DC=loc"
-```
+Write-Host "Importation en cours..." -ForegroundColor Green
 
+try {
+    # Validation ou création de l'OU cible
+    Ensure-TargetOU -TargetOU $TargetOU
 
--- 
-	
+    # Première passe : création des OUs
+    Import-OUs -OUs $data.OUs -TargetOU $TargetOU
 
-Nantenaina RANDRIANASOLO
-BUT2 - Cybersécurité
-Alternant
+    # Deuxième passe : création des objets
+    Import-Objects -Objects $data.Objects
 
-iut nord franche-comté
+    # Troisième passe : restauration des appartenances aux groupes
+    Import-GroupMemberships -GroupMemberships $data.GroupMemberships
 
-Université Franche-comté
-
-FAEC : nrandrianasolo@fondation-arcenciel.fr
-PRO : r.nantenaina@outlook.fr
-07 66 81 07 96
-
-
-4 place Tharradin | 25200 Montbéliard
-www.iut-nfc.univ-fcomte.fr
- 
+    Write-Host "Importation terminée." -ForegroundColor Green
+} catch {
+    Write-Error "Erreur lors de l'importation : $_"
+}
